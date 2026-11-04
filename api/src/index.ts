@@ -143,4 +143,153 @@ app.post('/api/homes/:homeId/bills', async (c) => {
   )
 })
 
+// POST /api/bills/:billId/shares/:shareId/pay
+app.post('/api/bills/:billId/shares/:shareId/pay', async (c) => {
+  const billId = c.req.param('billId')
+  const shareId = c.req.param('shareId')
+
+  // 1. Order of checks: share exists under that bill (404)
+  const share = await c.env.DB.prepare(
+    'SELECT id, bill_id AS billId, member_id AS memberId, amount_cents AS amountCents, paid_at AS paidAt, idempotency_key AS idempotencyKey FROM shares WHERE id = ? AND bill_id = ?',
+  )
+    .bind(shareId, billId)
+    .first<{
+      id: string
+      billId: string
+      memberId: string
+      amountCents: number
+      paidAt: string | null
+      idempotencyKey: string | null
+    }>()
+
+  if (!share) {
+    return c.json({ error: 'Share or bill not found' }, 404)
+  }
+
+  // 2. Idempotency-Key present (400)
+  const idempotencyKey = c.req.header('Idempotency-Key')
+  if (!idempotencyKey || idempotencyKey.trim().length === 0) {
+    return c.json({ error: 'Idempotency-Key header is required' }, 400)
+  }
+
+  // If already paid with the same key, return existing record (idempotency)
+  if (share.paidAt !== null) {
+    if (share.idempotencyKey === idempotencyKey) {
+      return c.json(
+        {
+          id: share.id,
+          memberId: share.memberId,
+          amountCents: share.amountCents,
+          paidAt: share.paidAt,
+        },
+        200,
+      )
+    }
+    // Already paid with a different key -> 409 Conflict
+    return c.json({ error: 'Share has already been paid with a different key' }, 409)
+  }
+
+  // 3. One atomic statement to mark share as paid
+  const now = new Date().toISOString()
+  const updated = await c.env.DB.prepare(
+    `UPDATE shares
+     SET paid_at = ?, idempotency_key = ?
+     WHERE id = ? AND bill_id = ? AND paid_at IS NULL
+     RETURNING id, member_id AS memberId, amount_cents AS amountCents, paid_at AS paidAt, idempotency_key AS idempotencyKey`,
+  )
+    .bind(now, idempotencyKey, shareId, billId)
+    .first<{
+      id: string
+      memberId: string
+      amountCents: number
+      paidAt: string
+      idempotencyKey: string
+    }>()
+
+  if (updated) {
+    return c.json(
+      {
+        id: updated.id,
+        memberId: updated.memberId,
+        amountCents: updated.amountCents,
+        paidAt: updated.paidAt,
+      },
+      200,
+    )
+  }
+
+  // Concurrent payment race handling
+  const current = await c.env.DB.prepare(
+    'SELECT id, member_id AS memberId, amount_cents AS amountCents, paid_at AS paidAt, idempotency_key AS idempotencyKey FROM shares WHERE id = ? AND bill_id = ?',
+  )
+    .bind(shareId, billId)
+    .first<{
+      id: string
+      memberId: string
+      amountCents: number
+      paidAt: string
+      idempotencyKey: string
+    }>()
+
+  if (current && current.idempotencyKey === idempotencyKey) {
+    return c.json(
+      {
+        id: current.id,
+        memberId: current.memberId,
+        amountCents: current.amountCents,
+        paidAt: current.paidAt,
+      },
+      200,
+    )
+  }
+
+  return c.json({ error: 'Share has already been paid with a different key' }, 409)
+})
+
+// GET /api/homes/:homeId/balances
+app.get('/api/homes/:homeId/balances', async (c) => {
+  const homeId = c.req.param('homeId')
+
+  const home = await c.env.DB.prepare('SELECT id FROM homes WHERE id = ?')
+    .bind(homeId)
+    .first<{ id: string }>()
+
+  if (!home) {
+    return c.json({ error: 'Home not found' }, 404)
+  }
+
+  const balancesResult = await c.env.DB.prepare(
+    `SELECT
+       m.id AS memberId,
+       m.name,
+       COALESCE(
+         (
+           SELECT SUM(s.amount_cents)
+           FROM shares s
+           JOIN bills b ON b.id = s.bill_id
+           WHERE s.member_id = m.id
+             AND b.home_id = m.home_id
+             AND s.paid_at IS NULL
+         ),
+         0
+       ) AS outstandingCents
+     FROM members m
+     WHERE m.home_id = ?
+     ORDER BY m.created_at ASC, m.rowid ASC`,
+  )
+    .bind(homeId)
+    .all<{
+      memberId: string
+      name: string
+      outstandingCents: number
+    }>()
+
+  return c.json(
+    {
+      balances: balancesResult.results || [],
+    },
+    200,
+  )
+})
+
 export default app
